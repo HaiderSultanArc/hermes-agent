@@ -387,6 +387,9 @@ This runtime is **opt-in beta**. Working as of Hermes Agent 2026.5 + Codex CLI 0
 - Toggle on/off cycle
 - Memory and skill nudge counters (verified live via integration tests)
 - Hermes web_search through codex (verified live: "OpenAI Codex CLI – Getting Started" returned end-to-end)
+- Live assistant deltas, reasoning, and stable-ID tool start/completion events in
+  the TUI and gateways. The completion-only history projector remains separate,
+  so resumed sessions hydrate the same tool cards shown during the turn.
 
 Known limitations:
 

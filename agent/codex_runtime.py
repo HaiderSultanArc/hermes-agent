@@ -16,11 +16,12 @@ compatibility.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,213 @@ def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
         return tool, tool, args
 
     return None
+
+
+def _codex_tool_descriptor(item: dict) -> Optional[Tuple[str, str, dict]]:
+    """Return ``(call_id, name, args)`` for a tool-shaped Codex item.
+
+    Names, arguments, and deterministic IDs deliberately mirror
+    :mod:`agent.transports.codex_event_projector`.  That keeps a live TUI tool
+    card correlated with the same tool call after the session is resumed.
+    """
+    from agent.transports.codex_event_projector import _deterministic_call_id
+
+    if not isinstance(item, dict):
+        return None
+
+    item_type = item.get("type") or ""
+    item_id = item.get("id") or ""
+    if item_type == "commandExecution":
+        return (
+            _deterministic_call_id("exec", item_id),
+            "exec_command",
+            {"command": item.get("command") or "", "cwd": item.get("cwd") or ""},
+        )
+
+    if item_type == "fileChange":
+        changes = []
+        for change in item.get("changes") or []:
+            if not isinstance(change, dict):
+                continue
+            kind = change.get("kind") or {}
+            changes.append({
+                "kind": kind.get("type") if isinstance(kind, dict) else "update",
+                "path": change.get("path") or "",
+            })
+        for change in changes:
+            change["kind"] = change["kind"] or "update"
+        return (
+            _deterministic_call_id("apply_patch", item_id),
+            "apply_patch",
+            {"changes": changes},
+        )
+
+    if item_type == "mcpToolCall":
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or "unknown"
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {"arguments": args}
+        return (
+            _deterministic_call_id(f"mcp__{server}__{tool}", item_id),
+            f"mcp.{server}.{tool}",
+            args,
+        )
+
+    if item_type == "dynamicToolCall":
+        tool = item.get("tool") or "unknown"
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {"arguments": args}
+        return (_deterministic_call_id(f"dyn_{tool}", item_id), tool, args)
+
+    return None
+
+
+def _codex_tool_result(item: dict) -> str:
+    """Format a completed Codex tool result like the history projector."""
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        output = item.get("aggregatedOutput") or ""
+        exit_code = item.get("exitCode")
+        if exit_code is not None and exit_code != 0:
+            output = f"[exit {exit_code}]\n{output}"
+        return output
+
+    if item_type == "fileChange":
+        status = item.get("status") or "unknown"
+        return (
+            f"apply_patch status={status}, {len(item.get('changes') or [])} change(s)"
+        )
+
+    if item_type == "mcpToolCall":
+        error = item.get("error")
+        try:
+            if error:
+                return f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
+            result = item.get("result")
+            return (
+                json.dumps(result, ensure_ascii=False)[:4000]
+                if result is not None
+                else ""
+            )
+        except (TypeError, ValueError):
+            return repr(error if error else item.get("result"))[:4000]
+
+    if item_type == "dynamicToolCall":
+        content_items = item.get("contentItems") or []
+        if isinstance(content_items, list) and content_items:
+            try:
+                return json.dumps(content_items, ensure_ascii=False)[:4000]
+            except (TypeError, ValueError):
+                return repr(content_items)[:4000]
+        return f"success={item.get('success')}"
+
+    return ""
+
+
+def _codex_tool_preview(name: str, args: dict) -> str:
+    """Compact progress preview for gateway consumers without tool cards."""
+    if name == "exec_command":
+        return str(args.get("command") or "")
+    if name == "apply_patch":
+        paths = [
+            str(change.get("path"))
+            for change in args.get("changes") or []
+            if isinstance(change, dict) and change.get("path")
+        ]
+        if paths:
+            suffix = f", +{len(paths) - 3} more" if len(paths) > 3 else ""
+            return f"{', '.join(paths[:3])}{suffix}"
+        return "file changes"
+    return name.rsplit(".", 1)[-1]
+
+
+def _codex_live_event(agent, note: dict) -> None:
+    """Bridge app-server notifications to Hermes' live display callbacks.
+
+    Codex history projection intentionally materializes only completed items.
+    Live clients therefore need this separate, best-effort path for text,
+    reasoning, and tool activity.  Both progress callbacks and authoritative
+    stable-ID tool callbacks are fired, matching the native tool executor's
+    contract across gateways and the TUI.
+    """
+    if not isinstance(note, dict):
+        return
+    method = note.get("method") or ""
+    params = note.get("params") or {}
+    if not isinstance(params, dict):
+        return
+
+    if method == "item/agentMessage/delta":
+        delta = params.get("delta")
+        if delta:
+            try:
+                agent._fire_stream_delta(str(delta))
+            except Exception:  # Callback implementations are external to this bridge.
+                logger.debug("codex message-delta callback raised", exc_info=True)
+        return
+
+    if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
+        delta = params.get("delta")
+        if delta:
+            try:
+                agent._fire_reasoning_delta(str(delta))
+            except Exception:  # Callback implementations are external to this bridge.
+                logger.debug("codex reasoning-delta callback raised", exc_info=True)
+        return
+
+    if method not in {"item/started", "item/completed"}:
+        return
+    item = params.get("item") or {}
+    descriptor = _codex_tool_descriptor(item)
+    if descriptor is None:
+        return
+    call_id, name, args = descriptor
+
+    if method == "item/started":
+        progress_callback = getattr(agent, "tool_progress_callback", None)
+        if progress_callback is not None:
+            try:
+                progress_callback(
+                    "tool.started", name, _codex_tool_preview(name, args), args
+                )
+            except Exception:  # Callback implementations are external to this bridge.
+                logger.debug("codex tool-progress callback raised", exc_info=True)
+        start_callback = getattr(agent, "tool_start_callback", None)
+        if start_callback is not None:
+            try:
+                start_callback(call_id, name, args)
+            except Exception:  # Callback implementations are external to this bridge.
+                logger.debug("codex tool-start callback raised", exc_info=True)
+        return
+
+    result = _codex_tool_result(item)
+    duration_ms = item.get("durationMs")
+    duration = duration_ms / 1000 if isinstance(duration_ms, (int, float)) else 0.0
+    is_error = bool(item.get("error")) or (
+        item.get("type") == "commandExecution" and item.get("exitCode") not in (None, 0)
+    )
+    progress_callback = getattr(agent, "tool_progress_callback", None)
+    if progress_callback is not None:
+        try:
+            progress_callback(
+                "tool.completed",
+                name,
+                None,
+                None,
+                duration=duration,
+                is_error=is_error,
+                result=result,
+            )
+        except Exception:  # Callback implementations are external to this bridge.
+            logger.debug("codex tool-progress callback raised", exc_info=True)
+    complete_callback = getattr(agent, "tool_complete_callback", None)
+    if complete_callback is not None:
+        try:
+            complete_callback(call_id, name, args, result)
+        except Exception:  # Callback implementations are external to this bridge.
+            logger.debug("codex tool-complete callback raised", exc_info=True)
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -380,22 +588,6 @@ def run_codex_app_server_turn(
                 exc_info=True,
             )
 
-        def _on_codex_event(note: dict) -> None:
-            # Bridge Codex app-server item/started notifications to Hermes
-            # tool-progress so gateways show verbose "running X" breadcrumbs
-            # on this route too (#38835).
-            progress_callback = getattr(agent, "tool_progress_callback", None)
-            if progress_callback is None:
-                return
-            mapped = _codex_note_to_tool_progress(note)
-            if mapped is None:
-                return
-            tool_name, preview, args = mapped
-            try:
-                progress_callback("tool.started", tool_name, preview, args)
-            except Exception:
-                logger.debug("codex tool-progress callback raised", exc_info=True)
-
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
@@ -403,7 +595,10 @@ def run_codex_app_server_turn(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
             ),
-            on_event=_on_codex_event,
+            # The projector below is history-only. This callback is the live
+            # display path and reads the host callbacks dynamically, including
+            # callbacks re-bound by gateways between turns.
+            on_event=lambda note: _codex_live_event(agent, note),
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
