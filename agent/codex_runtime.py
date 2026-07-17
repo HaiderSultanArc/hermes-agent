@@ -21,271 +21,9 @@ import logging
 import os
 import time
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List
 
 logger = logging.getLogger(__name__)
-
-
-def _codex_note_to_tool_progress(note: dict) -> tuple[str, str, dict] | None:
-    """Map a Codex app-server ``item/started`` notification to a Hermes
-    tool-progress event ``(tool_name, preview, args)``.
-
-    The Codex app-server runtime processes ``item/started`` notifications for
-    command execution, file changes, and MCP/dynamic tool calls, but never
-    surfaced them as Hermes tool-progress events — so gateways (Telegram, etc.)
-    showed no verbose "running X" breadcrumbs on this route while every other
-    provider did (#38835). Returns None for items that aren't tool-shaped.
-    """
-    if not isinstance(note, dict) or note.get("method") != "item/started":
-        return None
-    params = note.get("params") or {}
-    item = params.get("item") or {}
-    if not isinstance(item, dict):
-        return None
-
-    item_type = item.get("type") or ""
-    if item_type == "commandExecution":
-        command = item.get("command") or ""
-        return "exec_command", command, {"command": command, "cwd": item.get("cwd") or ""}
-
-    if item_type == "fileChange":
-        changes = item.get("changes") or []
-        preview = "file changes"
-        if isinstance(changes, list) and changes:
-            paths = [
-                str(change.get("path"))
-                for change in changes
-                if isinstance(change, dict) and change.get("path")
-            ]
-            if paths:
-                preview = ", ".join(paths[:3])
-                if len(paths) > 3:
-                    preview += f", +{len(paths) - 3} more"
-        return "apply_patch", preview, {"changes": changes}
-
-    if item_type == "mcpToolCall":
-        server = item.get("server") or "mcp"
-        tool = item.get("tool") or "unknown"
-        args = item.get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {"arguments": args}
-        return f"mcp.{server}.{tool}", tool, args
-
-    if item_type == "dynamicToolCall":
-        tool = item.get("tool") or "unknown"
-        args = item.get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {"arguments": args}
-        return tool, tool, args
-
-    return None
-
-
-def _codex_tool_descriptor(item: dict) -> Optional[Tuple[str, str, dict]]:
-    """Return ``(call_id, name, args)`` for a tool-shaped Codex item.
-
-    Names, arguments, and deterministic IDs deliberately mirror
-    :mod:`agent.transports.codex_event_projector`.  That keeps a live TUI tool
-    card correlated with the same tool call after the session is resumed.
-    """
-    from agent.transports.codex_event_projector import _deterministic_call_id
-
-    if not isinstance(item, dict):
-        return None
-
-    item_type = item.get("type") or ""
-    item_id = item.get("id") or ""
-    if item_type == "commandExecution":
-        return (
-            _deterministic_call_id("exec", item_id),
-            "exec_command",
-            {"command": item.get("command") or "", "cwd": item.get("cwd") or ""},
-        )
-
-    if item_type == "fileChange":
-        changes = []
-        for change in item.get("changes") or []:
-            if not isinstance(change, dict):
-                continue
-            kind = change.get("kind") or {}
-            changes.append({
-                "kind": kind.get("type") if isinstance(kind, dict) else "update",
-                "path": change.get("path") or "",
-            })
-        for change in changes:
-            change["kind"] = change["kind"] or "update"
-        return (
-            _deterministic_call_id("apply_patch", item_id),
-            "apply_patch",
-            {"changes": changes},
-        )
-
-    if item_type == "mcpToolCall":
-        server = item.get("server") or "mcp"
-        tool = item.get("tool") or "unknown"
-        args = item.get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {"arguments": args}
-        return (
-            _deterministic_call_id(f"mcp__{server}__{tool}", item_id),
-            f"mcp.{server}.{tool}",
-            args,
-        )
-
-    if item_type == "dynamicToolCall":
-        tool = item.get("tool") or "unknown"
-        args = item.get("arguments") or {}
-        if not isinstance(args, dict):
-            args = {"arguments": args}
-        return (_deterministic_call_id(f"dyn_{tool}", item_id), tool, args)
-
-    return None
-
-
-def _codex_tool_result(item: dict) -> str:
-    """Format a completed Codex tool result like the history projector."""
-    item_type = item.get("type") or ""
-    if item_type == "commandExecution":
-        output = item.get("aggregatedOutput") or ""
-        exit_code = item.get("exitCode")
-        if exit_code is not None and exit_code != 0:
-            output = f"[exit {exit_code}]\n{output}"
-        return output
-
-    if item_type == "fileChange":
-        status = item.get("status") or "unknown"
-        return (
-            f"apply_patch status={status}, {len(item.get('changes') or [])} change(s)"
-        )
-
-    if item_type == "mcpToolCall":
-        error = item.get("error")
-        try:
-            if error:
-                return f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}"
-            result = item.get("result")
-            return (
-                json.dumps(result, ensure_ascii=False)[:4000]
-                if result is not None
-                else ""
-            )
-        except (TypeError, ValueError):
-            return repr(error if error else item.get("result"))[:4000]
-
-    if item_type == "dynamicToolCall":
-        content_items = item.get("contentItems") or []
-        if isinstance(content_items, list) and content_items:
-            try:
-                return json.dumps(content_items, ensure_ascii=False)[:4000]
-            except (TypeError, ValueError):
-                return repr(content_items)[:4000]
-        return f"success={item.get('success')}"
-
-    return ""
-
-
-def _codex_tool_preview(name: str, args: dict) -> str:
-    """Compact progress preview for gateway consumers without tool cards."""
-    if name == "exec_command":
-        return str(args.get("command") or "")
-    if name == "apply_patch":
-        paths = [
-            str(change.get("path"))
-            for change in args.get("changes") or []
-            if isinstance(change, dict) and change.get("path")
-        ]
-        if paths:
-            suffix = f", +{len(paths) - 3} more" if len(paths) > 3 else ""
-            return f"{', '.join(paths[:3])}{suffix}"
-        return "file changes"
-    return name.rsplit(".", 1)[-1]
-
-
-def _codex_live_event(agent, note: dict) -> None:
-    """Bridge app-server notifications to Hermes' live display callbacks.
-
-    Codex history projection intentionally materializes only completed items.
-    Live clients therefore need this separate, best-effort path for text,
-    reasoning, and tool activity.  Both progress callbacks and authoritative
-    stable-ID tool callbacks are fired, matching the native tool executor's
-    contract across gateways and the TUI.
-    """
-    if not isinstance(note, dict):
-        return
-    method = note.get("method") or ""
-    params = note.get("params") or {}
-    if not isinstance(params, dict):
-        return
-
-    if method == "item/agentMessage/delta":
-        delta = params.get("delta")
-        if delta:
-            try:
-                agent._fire_stream_delta(str(delta))
-            except Exception:  # Callback implementations are external to this bridge.
-                logger.debug("codex message-delta callback raised", exc_info=True)
-        return
-
-    if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
-        delta = params.get("delta")
-        if delta:
-            try:
-                agent._fire_reasoning_delta(str(delta))
-            except Exception:  # Callback implementations are external to this bridge.
-                logger.debug("codex reasoning-delta callback raised", exc_info=True)
-        return
-
-    if method not in {"item/started", "item/completed"}:
-        return
-    item = params.get("item") or {}
-    descriptor = _codex_tool_descriptor(item)
-    if descriptor is None:
-        return
-    call_id, name, args = descriptor
-
-    if method == "item/started":
-        progress_callback = getattr(agent, "tool_progress_callback", None)
-        if progress_callback is not None:
-            try:
-                progress_callback(
-                    "tool.started", name, _codex_tool_preview(name, args), args
-                )
-            except Exception:  # Callback implementations are external to this bridge.
-                logger.debug("codex tool-progress callback raised", exc_info=True)
-        start_callback = getattr(agent, "tool_start_callback", None)
-        if start_callback is not None:
-            try:
-                start_callback(call_id, name, args)
-            except Exception:  # Callback implementations are external to this bridge.
-                logger.debug("codex tool-start callback raised", exc_info=True)
-        return
-
-    result = _codex_tool_result(item)
-    duration_ms = item.get("durationMs")
-    duration = duration_ms / 1000 if isinstance(duration_ms, (int, float)) else 0.0
-    is_error = bool(item.get("error")) or (
-        item.get("type") == "commandExecution" and item.get("exitCode") not in (None, 0)
-    )
-    progress_callback = getattr(agent, "tool_progress_callback", None)
-    if progress_callback is not None:
-        try:
-            progress_callback(
-                "tool.completed",
-                name,
-                None,
-                None,
-                duration=duration,
-                is_error=is_error,
-                result=result,
-            )
-        except Exception:  # Callback implementations are external to this bridge.
-            logger.debug("codex tool-progress callback raised", exc_info=True)
-    complete_callback = getattr(agent, "tool_complete_callback", None)
-    if complete_callback is not None:
-        try:
-            complete_callback(call_id, name, args, result)
-        except Exception:  # Callback implementations are external to this bridge.
-            logger.debug("codex tool-complete callback raised", exc_info=True)
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -530,6 +268,351 @@ def _record_codex_app_server_compaction(
     return True
 
 
+# ---------------------------------------------------------------------------
+# Codex app-server → Hermes UI bridge (#33200)
+#
+# The codex_app_server runtime hands the entire turn to a subprocess and
+# bypasses the normal Hermes tool loop. Without this bridge gateway
+# adapters (Discord, Telegram, TUI) never see live tool-progress bubbles
+# or interim assistant commentary while codex is working — the user just
+# stares at a quiet channel until the final answer lands. The bridge
+# translates raw codex JSON-RPC notifications into the same three agent
+# callbacks the standard runtime fires:
+#   - tool_progress_callback("tool.started"|"tool.completed", name, ...)
+#   - _fire_stream_delta(text) for streaming agentMessage chunks
+#   - _emit_interim_assistant_message({...}) for completed agentMessages
+# ---------------------------------------------------------------------------
+
+# Codex item types that map to a Hermes tool_call in the projector (and
+# therefore deserve a tool_progress bubble pair). The projector lives in
+# agent/transports/codex_event_projector.py — keep these in sync so the
+# tool name shown in the UI matches the name recorded in messages.
+# webSearch is codex's built-in web search tool — it has no projector
+# entry (codex handles it internally) but still deserves a bubble.
+_CODEX_TOOL_ITEM_TYPES = frozenset(
+    {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "webSearch"}
+)
+
+# Internal MCP server that wraps Hermes' native tools for codex. When
+# codex calls back through it, the inner dispatch runs in a SEPARATE
+# hermes-tools-mcp-server subprocess that has no access to the parent
+# agent's tool_progress_callback — so the inner call can never surface
+# its own native progress event. The codex-level mcpToolCall event IS
+# the display event for those calls; we strip the mcp.hermes-tools.*
+# namespacing and emit the bare tool name (web_search, browser_navigate,
+# vision_analyze, ...) since the user thinks of these as Hermes tools,
+# not as MCP calls.
+_INTERNAL_MCP_SERVER = "hermes-tools"
+
+
+def _codex_item_to_tool_name(item: dict) -> str:
+    """Synthetic Hermes tool name for a codex item. Mirrors
+    CodexEventProjector so the progress bubble and the projected
+    tool_calls entry use the same identifier."""
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        return "exec_command"
+    if item_type == "fileChange":
+        return "apply_patch"
+    if item_type == "mcpToolCall":
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or "unknown"
+        if server == _INTERNAL_MCP_SERVER:
+            return tool
+        return f"mcp.{server}.{tool}"
+    if item_type == "dynamicToolCall":
+        return item.get("tool") or "dynamic"
+    if item_type == "webSearch":
+        return "web_search"
+    return item_type or "unknown"
+
+
+def _codex_item_to_call_id(item: dict) -> str:
+    """Return the projector-compatible stable ID for a live tool item."""
+    from agent.transports.codex_event_projector import _deterministic_call_id
+
+    item_type = item.get("type") or ""
+    item_id = item.get("id") or ""
+    if item_type == "commandExecution":
+        prefix = "exec"
+    elif item_type == "fileChange":
+        prefix = "apply_patch"
+    elif item_type == "mcpToolCall":
+        server = item.get("server") or "mcp"
+        tool = item.get("tool") or "unknown"
+        prefix = f"mcp__{server}__{tool}"
+    elif item_type == "dynamicToolCall":
+        prefix = f"dyn_{item.get('tool') or 'dynamic'}"
+    else:
+        prefix = _codex_item_to_tool_name(item)
+    return _deterministic_call_id(prefix, item_id)
+
+
+def _codex_item_to_args(item: dict) -> dict:
+    """Args dict surfaced to tool_progress_callback("tool.started", ...).
+    Mirrors the projector's _project_command / _project_file_change /
+    _project_mcp_tool_call / _project_dynamic_tool_call shapes."""
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        return {"command": item.get("command") or "",
+                "cwd": item.get("cwd") or ""}
+    if item_type == "fileChange":
+        return {"changes": [
+            {"kind": (c.get("kind") or {}).get("type") or "update",
+             "path": c.get("path") or ""}
+            for c in (item.get("changes") or []) if isinstance(c, dict)
+        ]}
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        args = item.get("arguments") or {}
+        return args if isinstance(args, dict) else {"arguments": args}
+    if item_type == "webSearch":
+        return {"query": item.get("query") or ""}
+    return {}
+
+
+def _codex_item_to_preview(item: dict) -> Any:
+    """Short human-readable preview for the tool.started bubble. Returns
+    None when no useful preview is available (Hermes' UI tolerates None)."""
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        cmd = item.get("command") or ""
+        return cmd[:120] if cmd else None
+    if item_type == "fileChange":
+        paths = [c.get("path") for c in (item.get("changes") or [])
+                 if isinstance(c, dict) and c.get("path")]
+        if not paths:
+            return None
+        preview = ", ".join(paths[:3])
+        if len(paths) > 3:
+            preview += f", +{len(paths) - 3} more"
+        return preview
+    if item_type in {"mcpToolCall", "dynamicToolCall"}:
+        args = item.get("arguments") or {}
+        if not isinstance(args, dict) or not args:
+            return None
+        try:
+            return json.dumps(args, ensure_ascii=False)[:120]
+        except (TypeError, ValueError):
+            return None
+    if item_type == "webSearch":
+        query = item.get("query") or ""
+        return query[:120] if query else None
+    return None
+
+
+def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
+    """Return (result_text, is_error) for a completed codex tool item.
+    Mirrors the projector's tool-result content so the bubble shows the
+    same outcome string that ends up in the messages list."""
+    item_type = item.get("type") or ""
+    if item_type == "commandExecution":
+        out = item.get("aggregatedOutput") or ""
+        exit_code = item.get("exitCode")
+        is_error = bool(exit_code is not None and exit_code != 0)
+        if is_error:
+            out = f"[exit {exit_code}]\n{out}"
+        return out, is_error
+    if item_type == "fileChange":
+        status = item.get("status") or "unknown"
+        n = len(item.get("changes") or [])
+        return (
+            f"apply_patch status={status}, {n} change(s)",
+            status not in {"completed", "applied", "success"},
+        )
+    if item_type == "mcpToolCall":
+        error = item.get("error")
+        if error:
+            return (
+                f"[error] {json.dumps(error, ensure_ascii=False)[:1000]}",
+                True,
+            )
+        result = item.get("result")
+        return (
+            json.dumps(result, ensure_ascii=False)[:4000]
+            if result is not None else "",
+            False,
+        )
+    if item_type == "dynamicToolCall":
+        content_items = item.get("contentItems") or []
+        if isinstance(content_items, list) and content_items:
+            return (
+                json.dumps(content_items, ensure_ascii=False)[:4000],
+                not bool(item.get("success", True)),
+            )
+        success = item.get("success", True)
+        return f"success={success}", not bool(success)
+    return "", False
+
+
+def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
+    """Build an ``on_event`` callback that wires codex app-server JSON-RPC
+    notifications into Hermes' gateway UI callbacks.
+
+    Returns a single-argument callable suitable for
+    ``CodexAppServerSession(on_event=...)``.
+
+    Translation map:
+      * ``item/started`` for tool-shaped items → ``tool_progress_callback(
+        "tool.started", name, preview, args)``
+        and ``tool_start_callback(call_id, name, args)``
+      * ``item/completed`` for tool-shaped items → ``tool_progress_callback(
+        "tool.completed", name, None, None, duration=..., is_error=...,
+        result=...)`` and ``tool_complete_callback(call_id, name, args,
+        result)``
+      * ``item/agentMessage/delta`` → ``_fire_stream_delta(text)`` so chat
+        adapters can render the assistant's reply as it streams.
+      * ``item/reasoning/delta`` → ``_fire_reasoning_delta(text)``
+      * ``item/completed`` for ``agentMessage`` →
+        ``_emit_interim_assistant_message({"role": "assistant",
+        "content": text})``. The gateway's ``already_streamed`` check
+        dedupes against any text the stream-delta callback already
+        rendered for the same message.
+
+    All callback invocations are guarded — a buggy display callback must
+    not tear down the codex turn loop. Errors are logged at DEBUG so the
+    notification stream keeps flowing regardless.
+    """
+    # item_id -> (call_id, tool_name, args, started_wall_time). Populated on
+    # item/started and consumed on item/completed so duration is correct
+    # even when codex doesn't report durationMs.
+    started: dict[str, tuple[str, str, dict, float]] = {}
+
+    def _fire_tool_started(item: dict) -> None:
+        item_id = item.get("id") or ""
+        call_id = _codex_item_to_call_id(item)
+        name = _codex_item_to_tool_name(item)
+        args = _codex_item_to_args(item)
+        if item_id:
+            started[item_id] = (call_id, name, args, time.monotonic())
+        cb = getattr(agent, "tool_progress_callback", None)
+        if cb is not None:
+            try:
+                cb("tool.started", name, _codex_item_to_preview(item), args)
+            except Exception:
+                logger.debug(
+                    "tool_progress_callback raised on tool.started for %s",
+                    name, exc_info=True,
+                )
+        cb = getattr(agent, "tool_start_callback", None)
+        if cb is not None:
+            try:
+                cb(call_id, name, args)
+            except Exception:
+                logger.debug(
+                    "tool_start_callback raised for %s", name, exc_info=True
+                )
+
+    def _fire_tool_completed(item: dict) -> None:
+        item_id = item.get("id") or ""
+        prior = started.pop(item_id, None)
+        if prior is None:
+            call_id = _codex_item_to_call_id(item)
+            name = _codex_item_to_tool_name(item)
+            args = _codex_item_to_args(item)
+        else:
+            call_id, name, args, _started_at = prior
+        # Prefer codex's own durationMs when present so the bubble shows
+        # exact tool wall-time; fall back to our started timestamp; fall
+        # back to None if we never saw an item/started (some codex
+        # versions only emit completed for fast items).
+        duration: Any = None
+        codex_ms = item.get("durationMs")
+        if isinstance(codex_ms, (int, float)) and codex_ms >= 0:
+            duration = codex_ms / 1000.0
+        elif prior is not None:
+            duration = time.monotonic() - prior[3]
+        result, is_error = _codex_item_completion_payload(item)
+        cb = getattr(agent, "tool_progress_callback", None)
+        if cb is not None:
+            try:
+                cb("tool.completed", name, None, None,
+                   duration=duration, is_error=is_error, result=result)
+            except Exception:
+                logger.debug(
+                    "tool_progress_callback raised on tool.completed for %s",
+                    name, exc_info=True,
+                )
+        cb = getattr(agent, "tool_complete_callback", None)
+        if cb is not None:
+            try:
+                cb(call_id, name, args, result)
+            except Exception:
+                logger.debug(
+                    "tool_complete_callback raised for %s", name, exc_info=True
+                )
+
+    def _fire_text_delta(params: dict) -> None:
+        text = params.get("delta") or params.get("text") or ""
+        if not isinstance(text, str) or not text:
+            return
+        fn = getattr(agent, "_fire_stream_delta", None)
+        if fn is None:
+            return
+        try:
+            fn(text)
+        except Exception:
+            logger.debug("_fire_stream_delta raised", exc_info=True)
+
+    def _fire_reasoning_delta(params: dict) -> None:
+        text = params.get("delta") or params.get("text") or ""
+        if not isinstance(text, str) or not text:
+            return
+        fn = getattr(agent, "_fire_reasoning_delta", None)
+        if fn is None:
+            return
+        try:
+            fn(text)
+        except Exception:
+            logger.debug("_fire_reasoning_delta raised", exc_info=True)
+
+    def _fire_agent_message_completed(item: dict) -> None:
+        text = item.get("text") or ""
+        if not isinstance(text, str) or not text.strip():
+            return
+        # display.show_commentary=false — mid-turn narration stays off the
+        # visible interim path on this runtime too (same contract as the
+        # codex_responses commentary channel).
+        if not getattr(agent, "show_commentary", True):
+            return
+        emit = getattr(agent, "_emit_interim_assistant_message", None)
+        if emit is None:
+            return
+        try:
+            emit({"role": "assistant", "content": text})
+        except Exception:
+            logger.debug(
+                "_emit_interim_assistant_message raised", exc_info=True,
+            )
+
+    def on_event(note: dict) -> None:
+        if not isinstance(note, dict):
+            return
+        method = note.get("method") or ""
+        params = note.get("params") or {}
+        if not isinstance(params, dict):
+            params = {}
+        if method == "item/agentMessage/delta":
+            _fire_text_delta(params)
+            return
+        if method == "item/reasoning/delta":
+            _fire_reasoning_delta(params)
+            return
+        item = params.get("item")
+        if not isinstance(item, dict):
+            return
+        item_type = item.get("type") or ""
+        if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
+            _fire_tool_started(item)
+            return
+        if method == "item/completed":
+            if item_type in _CODEX_TOOL_ITEM_TYPES:
+                _fire_tool_completed(item)
+            elif item_type == "agentMessage":
+                _fire_agent_message_completed(item)
+
+    return on_event
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -588,6 +671,13 @@ def run_codex_app_server_turn(
                 exc_info=True,
             )
 
+        # Bridge codex JSON-RPC notifications (item/started, item/completed,
+        # item/agentMessage/delta, ...) into Hermes' gateway UI callbacks
+        # (tool_progress_callback, _fire_stream_delta,
+        # _emit_interim_assistant_message). Without this, Discord/Telegram
+        # users see no live tool-progress or interim commentary while
+        # codex_app_server is running — only the final answer (#33200).
+        # Supersedes the narrower item/started-only bridge from #38835.
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
@@ -595,10 +685,7 @@ def run_codex_app_server_turn(
                 auto_approve_exec=auto_approve_requests,
                 auto_approve_apply_patch=auto_approve_requests,
             ),
-            # The projector below is history-only. This callback is the live
-            # display path and reads the host callbacks dynamically, including
-            # callbacks re-bound by gateways between turns.
-            on_event=lambda note: _codex_live_event(agent, note),
+            on_event=make_codex_app_server_event_bridge(agent),
         )
 
     # NOTE: the user message is ALREADY appended to messages by the
@@ -801,15 +888,37 @@ def _item_field(item: Any, name: str, default: Any = None) -> Any:
 def _raise_stream_error(event: Any) -> None:
     """Raise a ``_StreamErrorEvent`` from a ``type=error`` SSE frame.
 
+    The Responses spec puts the failure details at the top level of the
+    frame (``{"type": "error", "code": ..., "message": ..., "param": ...}``),
+    but the official OpenAI SDK and several OpenAI-compatible proxies wrap
+    them in an HTTP-style nested envelope instead
+    (``{"type": "error", "error": {"code": ..., "message": ..., "param": ...}}``).
+    Read the top-level fields first, then fall back to the nested envelope so
+    the error classifier sees the provider's real code/message (rate-limit vs
+    context-overflow vs entitlement) rather than the generic placeholder.
+    Port of anomalyco/opencode#36130.
+
     Imported lazily so this module stays importable from places that don't
     pull in ``run_agent`` (e.g. plugin code, doc tools).
     """
     from run_agent import _StreamErrorEvent
-    message = (_event_field(event, "message", "") or "stream emitted error event").strip()
+
+    nested = _event_field(event, "error")
+
+    def _error_field(name: str) -> Any:
+        value = _event_field(event, name)
+        if value is None and nested is not None:
+            value = _item_field(nested, name)
+        return value
+
+    raw_message = _error_field("message")
+    if raw_message is not None and not isinstance(raw_message, str):
+        raw_message = str(raw_message)
+    message = (raw_message or "stream emitted error event").strip() or "stream emitted error event"
     raise _StreamErrorEvent(
         message,
-        code=_event_field(event, "code"),
-        param=_event_field(event, "param"),
+        code=_error_field("code"),
+        param=_error_field("param"),
     )
 
 
@@ -819,6 +928,7 @@ def _consume_codex_event_stream(
     model: str,
     on_text_delta=None,
     on_reasoning_delta=None,
+    on_commentary_message=None,
     on_first_delta=None,
     on_event=None,
     interrupt_check=None,
@@ -850,7 +960,11 @@ def _consume_codex_event_stream(
     * ``on_text_delta(str)`` — fires per ``response.output_text.delta``, suppressed
       once a function_call event is seen (so tool-call turns don't bleed text
       into the chat).
-    * ``on_reasoning_delta(str)`` — fires per ``response.reasoning.*.delta``.
+    * ``on_reasoning_delta(str)`` — fires per ``response.reasoning.*.delta`` and
+      ``phase=analysis`` message deltas. When no dedicated commentary callback
+      is supplied, commentary also uses this legacy fallback.
+    * ``on_commentary_message(str)`` — fires once per completed
+      ``phase=commentary`` message, before any following tool item executes.
     * ``on_first_delta()`` — one-shot, fires on the first text delta only.
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
@@ -861,6 +975,7 @@ def _consume_codex_event_stream(
     has_tool_calls = False
     first_delta_fired = False
     active_message_phase: str | None = None
+    commentary_text_deltas: List[str] = []
     terminal_status: str = "completed"
     terminal_usage: Any = None
     terminal_response_id: str = None
@@ -905,6 +1020,8 @@ def _consume_codex_event_stream(
             if item_type == "message":
                 phase = _item_field(item, "phase", None)
                 active_message_phase = phase.strip().lower() if isinstance(phase, str) else None
+                if active_message_phase == "commentary":
+                    commentary_text_deltas = []
             else:
                 active_message_phase = None
             if "function_call" in str(item_type):
@@ -913,10 +1030,16 @@ def _consume_codex_event_stream(
 
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
             delta_text = _event_field(event, "delta", "")
-            is_commentary_delta = active_message_phase in {"commentary", "analysis"}
-            if delta_text and is_commentary_delta:
-                # Commentary streams through the reasoning channel, not the
-                # visible answer stream (and stays out of output_text).
+            if delta_text and active_message_phase == "commentary":
+                commentary_text_deltas.append(delta_text)
+                # Preserve CLI/backward compatibility when no first-class
+                # commentary consumer is installed.
+                if on_commentary_message is None and on_reasoning_delta is not None:
+                    try:
+                        on_reasoning_delta(delta_text)
+                    except Exception:
+                        logger.debug("Codex stream on_reasoning_delta raised", exc_info=True)
+            elif delta_text and active_message_phase == "analysis":
                 if on_reasoning_delta is not None:
                     try:
                         on_reasoning_delta(delta_text)
@@ -956,6 +1079,27 @@ def _consume_codex_event_stream(
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
+                done_phase = _item_field(done_item, "phase", None)
+                done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None
+                if done_phase == "commentary" and on_commentary_message is not None:
+                    commentary_text = "".join(commentary_text_deltas).strip()
+                    if not commentary_text:
+                        content_parts = _item_field(done_item, "content", [])
+                        if isinstance(content_parts, list):
+                            commentary_text = "".join(
+                                str(_item_field(part, "text", "") or "")
+                                for part in content_parts
+                                if _item_field(part, "type", "") == "output_text"
+                            ).strip()
+                    if commentary_text:
+                        try:
+                            on_commentary_message(commentary_text)
+                        except Exception:
+                            logger.debug(
+                                "Codex stream on_commentary_message raised",
+                                exc_info=True,
+                            )
+                    commentary_text_deltas = []
             continue
 
         if event_type in _TERMINAL_EVENT_TYPES:
@@ -1056,13 +1200,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_reasoning_delta(text: str) -> None:
         agent._fire_reasoning_delta(text)
 
+    def _on_commentary_message(text: str) -> None:
+        agent._fire_streamed_codex_commentary(text)
+
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
-
-    def _interrupt_check() -> bool:
-        return bool(agent._interrupt_requested)
 
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
@@ -1083,6 +1227,27 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 continue
             raise
 
+        # Claim the delta sink for THIS attempt (#65991) — parity with the
+        # chat_completions/anthropic/bedrock paths. If a prior attempt's
+        # stream is somehow still alive, this claim supersedes it so its
+        # late deltas are fenced out of the turn; conversely, a newer
+        # attempt supersedes us and the interrupt_check below stops our
+        # consumption immediately.
+        _writer_token = agent._claim_stream_writer()
+
+        def _interrupt_or_superseded(_tok=_writer_token) -> bool:
+            if agent._interrupt_requested:
+                return True
+            if not agent._stream_writer_is_current(_tok):
+                logger.warning(
+                    "Codex streaming attempt superseded by a newer stream; "
+                    "stopping consumption to preserve the single-writer "
+                    "invariant (model=%s).",
+                    api_kwargs.get("model", "unknown"),
+                )
+                return True
+            return False
+
         try:
             # Compatibility: some mocks/providers return a concrete response
             # instead of an iterable.  Pass it straight through.
@@ -1095,9 +1260,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     model=api_kwargs.get("model"),
                     on_text_delta=_on_text_delta,
                     on_reasoning_delta=_on_reasoning_delta,
+                    on_commentary_message=(
+                        _on_commentary_message
+                        if (
+                            getattr(agent, "interim_assistant_callback", None) is not None
+                            and getattr(agent, "show_commentary", True)
+                        )
+                        else None
+                    ),
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
-                    interrupt_check=_interrupt_check,
+                    interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
@@ -1146,4 +1319,5 @@ __all__ = [
     "run_codex_stream",
     "run_codex_create_stream_fallback",
     "_consume_codex_event_stream",
+    "make_codex_app_server_event_bridge",
 ]

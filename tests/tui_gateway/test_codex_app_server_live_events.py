@@ -2,7 +2,7 @@
 
 from types import SimpleNamespace
 
-from agent.codex_runtime import _codex_live_event
+from agent.codex_runtime import make_codex_app_server_event_bridge
 from tui_gateway import server
 
 
@@ -40,9 +40,9 @@ def test_codex_bridge_emits_one_authoritative_tui_tool_lifecycle(monkeypatch):
         "cwd": "/tmp",
     }
 
-    _codex_live_event(agent, {"method": "item/started", "params": {"item": started}})
-    _codex_live_event(
-        agent,
+    bridge = make_codex_app_server_event_bridge(agent)
+    bridge({"method": "item/started", "params": {"item": started}})
+    bridge(
         {
             "method": "item/completed",
             "params": {"item": dict(started, aggregatedOutput="/tmp\n", exitCode=0)},
