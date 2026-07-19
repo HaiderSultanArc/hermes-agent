@@ -77,7 +77,6 @@ class CodexAppServerClient:
         env: Optional[dict[str, str]] = None,
     ) -> None:
         self._codex_bin = codex_bin
-        self._codex_home = resolve_codex_home(codex_home)
         # codex app-server is a model-driving CLI executor: it runs a
         # model-chosen agentic loop that executes shell commands, so it
         # legitimately needs LLM provider credentials (inherit_credentials=True)
@@ -92,6 +91,10 @@ class CodexAppServerClient:
         spawn_env = hermes_subprocess_env(inherit_credentials=True)
         if env:
             spawn_env.update(env)
+        effective_codex_home = str(codex_home or "").strip() or spawn_env.get(
+            CODEX_HOME_ENV
+        )
+        self._codex_home = resolve_codex_home(effective_codex_home)
         # Pin the resolved state directory explicitly so app-server loads the
         # same config, auth, plugins, and MCP servers as a direct Codex launch.
         # Do not depend on incidental inheritance through the subprocess

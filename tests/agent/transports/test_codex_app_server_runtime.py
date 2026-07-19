@@ -252,13 +252,55 @@ class TestSpawnEnvIsolation:
         monkeypatch.setenv("HOME", "/users/alice")
 
         client = cas.CodexAppServerClient(
-            codex_bin="codex", codex_home="/tmp/profile/codex"
+            codex_bin="codex",
+            codex_home="/tmp/profile/codex",
+            env={"CODEX_HOME": "/tmp/wrapper/codex"},
         )
         client._closed = True
 
         assert captured["env"].get("CODEX_HOME") == "/tmp/profile/codex"
         # And HOME still passes through unchanged
         assert captured["env"].get("HOME") == "/users/alice"
+
+    def test_spawn_env_preserves_caller_CODEX_HOME(self, monkeypatch):
+        """A child-specific CODEX_HOME wins over the inherited environment
+        when the explicit codex_home argument is unset."""
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["env"] = kwargs.get("env", {}).copy()
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("CODEX_HOME", "/users/alice/.codex")
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", env={"CODEX_HOME": "/tmp/wrapper/codex"}
+        )
+        client._closed = True
+
+        assert client.codex_home == "/tmp/wrapper/codex"
+        assert captured["env"].get("CODEX_HOME") == "/tmp/wrapper/codex"
 
     def test_kanban_worker_adds_only_kanban_writable_root(self, monkeypatch):
         """Codex-runtime Kanban workers need to write board state outside
